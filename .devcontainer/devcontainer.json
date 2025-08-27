@@ -1,0 +1,26 @@
+{
+  "name": "name",
+  "image": "mcr.microsoft.com/devcontainers/python:3.11-bullseye",
+  "features": {
+    "ghcr.io/devcontainers/features/github-cli:1": {}, 
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+  },
+  "postCreateCommand": "python3 -m venv .venv && . .venv/bin/activate && pip install --upgrade pip && pip install -r requirements.txt",
+  "postStartCommand": "echo 'source .venv/bin/activate' >> ~/.bash_profile && echo 'source .venv/bin/activate' >> ~/.bashrc",
+  
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "python.defaultInterpreterPath": ".venv/bin/python"
+      },
+      "extensions": [
+        "ms-python.python",
+        "ms-toolsai.jupyter",
+        "ms-azuretools.vscode-docker",
+        "GitHub.copilot",
+        "ms-vscode.makefile-tools",
+        "github.vscode-github-actions"
+      ]
+    }
+  }
+}
