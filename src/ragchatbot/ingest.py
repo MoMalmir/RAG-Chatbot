@@ -78,7 +78,7 @@ def ingest_paths(
         encode_kwargs={"normalize_embeddings": True},
     )
 
-    vs = FAiss = FAISS.from_documents(chunks, embeddings)
+    vs = FAISS.from_documents(chunks, embeddings)
 
     outdir = Path(index_dir)
     outdir.mkdir(parents=True, exist_ok=True)
