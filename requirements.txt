@@ -1,0 +1,9 @@
+langchain>=0.2,<0.3
+langchain-community>=0.2,<0.3
+transformers>=4.41
+sentence-transformers>=2.7
+faiss-cpu>=1.7.4
+typer>=0.9
+rich>=13.7
+beautifulsoup4>=4.12     
+docx2txt>=0.8            
