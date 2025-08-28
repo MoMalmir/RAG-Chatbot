@@ -1,25 +1,38 @@
+"""
+Two-mode RAG (domain-agnostic):
+
+1) Evidence-only: return top-matching sentences with [n] citations
+   - Retrieval = BM25 (lexical) + FAISS (vector) + MMR + optional cross-encoder rerank
+   - No LLM involved
+
+2) Summarize with OpenRouter: summarize ONLY those evidence bullets into 2–4
+   sentences, preserving [n] citations. If API key is missing or the call fails,
+   we gracefully fall back to evidence-only.
+
+Keep this file compact and easy to explain in interviews.
+"""
+
+from curses import raw
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
-import re
 import hashlib
+import re
+import requests
 
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from transformers import (
-    AutoModelForQuestionAnswering,
-    AutoModelForSeq2SeqLM,
-    AutoTokenizer,
-    pipeline,
-)
 from rank_bm25 import BM25Okapi
 
 from .utils import DEVICE
 from .reranker import Reranker
 
 
+# ----------------------------- helpers ---------------------------------
+
 def _fmt_citation(meta: Dict[str, Any]) -> Dict[str, Any]:
+    """Format a display-friendly citation entry from doc metadata."""
     src = meta.get("source")
-    page = meta.get("page", None)  # 0-based from PyPDFLoader
+    page = meta.get("page", None)  # 0-based (PyPDFLoader)
     ftype = meta.get("filetype")
     label = Path(src).name if src else "unknown"
     if page is not None:
@@ -27,52 +40,50 @@ def _fmt_citation(meta: Dict[str, Any]) -> Dict[str, Any]:
     return {"label": label, "source": src, "page": page, "filetype": ftype}
 
 
-# -------------------- token helpers (no HF warnings) --------------------
+def _doc_key(d) -> str:
+    """Stable doc key for deduping across BM25/FAISS results."""
+    meta = d.metadata or {}
+    src = meta.get("source", "")
+    page = str(meta.get("page", ""))
+    head = (d.page_content or "")[:200]
+    h = hashlib.md5(head.encode("utf-8", errors="ignore")).hexdigest()
+    return f"{src}::{page}::{h}"
 
-def _safe_encode_ids(tokenizer, text: str) -> List[int]:
-    if hasattr(tokenizer, "_tokenizer") and tokenizer._tokenizer is not None:
-        return tokenizer._tokenizer.encode(text, add_special_tokens=False).ids
-    enc = tokenizer(
-        text,
-        add_special_tokens=False,
-        truncation=False,
-        return_attention_mask=False,
-        return_token_type_ids=False,
-    )
-    ids = enc["input_ids"]
-    return ids if isinstance(ids[0], int) else ids[0]
+def _normalize_text(s: str) -> str:
+    # join hyphenated line breaks, collapse newlines/spaces
+    s = re.sub(r"-\s*\n\s*", "", s)
+    s = re.sub(r"\s*\n\s*", " ", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
 
-def _token_len(tokenizer, text: str) -> int:
-    return len(_safe_encode_ids(tokenizer, text))
-
-def _trim_to_tokens(tokenizer, text: str, max_tokens: int) -> str:
-    ids = _safe_encode_ids(tokenizer, text)
-    if len(ids) <= max_tokens:
-        return text
-    ids = ids[:max_tokens]
-    return tokenizer.decode(ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
-
+def _is_junk_sentence(s: str) -> bool:
+    s_stripped = s.strip()
+    if len(s_stripped) < 20:
+        return True
+    if re.fullmatch(r"[\W_]+", s_stripped):
+        return True
+    lower = s_stripped.lower()
+    if re.fullmatch(r"(part|section|appendix)\s+\d+[:.)]?", lower):
+        return True
+    if s_stripped.isupper() and len(s_stripped) < 80:
+        return True  # short ALL-CAPS headings like "DOCUMENTS"
+    return False
 
 # ------------------------ sentence & context utils ----------------------
 
-_LEASE_KEYS = {
-    "guest", "guests", "visitor", "visitors", "overnight", "occupancy", "tenant",
-    "landlord", "rent", "deposit", "security", "fee", "key", "parking", "policy",
-    "rule", "rules", "violation", "notice"
-}
-_NIW_KEYS = {
-    "letter", "letters", "recommendation", "recommendations",
-    "reference", "references", "referee",
-    "independent", "dependent", "support", "evidence", "expert"
-}
-
 def _filter_sentences_for_question(text: str, question: str, max_chars: int = 1200) -> str:
+    """
+    Domain-agnostic pre-filter:
+    keep sentences that share words with the question.
+    Falls back to the first couple sentences if no overlap is found.
+    """
     q_words = set(re.findall(r"[a-zA-Z]{3,}", question.lower()))
-    keys = q_words | _LEASE_KEYS | _NIW_KEYS
     sentences = re.split(r"(?<=[.!?])\s+", (text or "").strip())
-    picked = [s for s in sentences if any(k in s.lower() for k in keys)]
+
+    picked = [s for s in sentences if any(w in s.lower() for w in q_words)]
     if not picked:
-        picked = sentences[:2]
+        picked = sentences[:2]  # graceful fallback
+
     out, used = [], 0
     for s in picked:
         s = s.strip()
@@ -82,46 +93,36 @@ def _filter_sentences_for_question(text: str, question: str, max_chars: int = 12
             break
         out.append(s)
         used += len(s) + 1
+
     return " ".join(out) if out else (text or "")[:max_chars]
 
-def _build_grounded_prompt(question: str, numbered_context: str) -> str:
-    return (
-        "You are a helpful assistant. Answer the user's question using ONLY the numbered context snippets.\n"
-        "Paraphrase; do not copy full sentences. Write 1–3 concise sentences, then add inline citations like [1], [2]. "
-        "Do not begin with a citation and do not answer with only citations.\n\n"
-        f"Question: {question}\n\n"
-        f"Context:\n{numbered_context}\n\n"
-        "Answer:"
-    )
 
-def _doc_key(d) -> str:
-    meta = d.metadata or {}
-    src = meta.get("source", "")
-    page = str(meta.get("page", ""))
-    h = hashlib.md5((d.page_content or "")[:200].encode("utf-8", errors="ignore")).hexdigest()
-    return f"{src}::{page}::{h}"
-
+# ----------------------------- core class ------------------------------
 
 class RAGQuery:
+    """
+    Retrieval + (optional) OpenRouter summarization.
+
+    Embeddings: sentence-transformers/all-mpnet-base-v2
+    Lexical:    rank-bm25
+    Vector:     FAISS
+    Reranker:   BAAI/bge-reranker-base (optional)
+    """
+
     def __init__(
         self,
         index_dir: str = "index",
         embed_model: str = "sentence-transformers/all-mpnet-base-v2",
-        qa_model_name: str = "bert-large-uncased-whole-word-masking-finetuned-squad",
-        gen_model_name: str = "google/flan-t5-base",
-        mode: str = "extractive",             # "extractive" | "generative"
-        initial_k: int = 10,
-        final_k: int = 4,
-        use_reranker: bool = True,            # default ON now
+        initial_k: int = 10,                  # retriever fan-out
+        final_k: int = 4,                     # contexts kept
+        use_reranker: bool = True,            # cross-encoder reranker
         reranker_model: str = "BAAI/bge-reranker-base",
     ) -> None:
-        self.mode = mode
-        self.qa_model_name = qa_model_name
-        self.gen_model_name = gen_model_name
         self.initial_k = initial_k
         self.final_k = max(1, final_k)
+        self.use_reranker = use_reranker
 
-        # vector store
+        # Embeddings + FAISS
         self.embeddings = HuggingFaceEmbeddings(
             model_name=embed_model,
             model_kwargs={"device": DEVICE},
@@ -129,65 +130,29 @@ class RAGQuery:
         )
         self.vs = FAISS.load_local(index_dir, self.embeddings, allow_dangerous_deserialization=True)
 
-        # build a BM25 index over *all* chunk texts from the vector store
+        # Doc list for BM25
         self._docs: List[Any] = list(self.vs.docstore._dict.values())
         corpus = [(d.page_content or "") for d in self._docs]
-        self._bm25 = BM25Okapi([t.lower().split() for t in corpus])
+        self._bm25_all = BM25Okapi([t.lower().split() for t in corpus])
 
-        # diverse vector retriever (MMR)
+        # FAISS retriever with MMR diversity
         self.retriever = self.vs.as_retriever(
             search_type="mmr",
-            search_kwargs={"k": self.initial_k, "fetch_k": max(20, self.initial_k * 4), "lambda_mult": 0.5},
+            search_kwargs={"k": initial_k, "fetch_k": max(20, initial_k * 4), "lambda_mult": 0.5},
         )
 
-        # reranker
-        self.use_reranker = use_reranker
+        # Optional cross-encoder reranker
         self.reranker = Reranker(model_name=reranker_model) if use_reranker else None
 
-        # lazy models
-        self._qa_pipe = None
-        self._qa_tok = None
-        self._gen_pipe = None
-        self._gen_tok = None
-
-    # --------------------------- models --------------------------------
-
-    def _ensure_extractive(self):
-        if self._qa_pipe is not None:
-            return
-        tok = AutoTokenizer.from_pretrained(self.qa_model_name)
-        qa_model = AutoModelForQuestionAnswering.from_pretrained(
-            self.qa_model_name,
-            torch_dtype=(__import__("torch").float16 if DEVICE == "cuda" else __import__("torch").float32),
-        ).to(DEVICE)
-        self._qa_tok = tok
-        self._qa_pipe = pipeline(
-            "question-answering", model=qa_model, tokenizer=tok, device=0 if DEVICE == "cuda" else -1
-        )
-
-    def _ensure_generative(self):
-        if self._gen_pipe is not None:
-            return
-        tok = AutoTokenizer.from_pretrained(self.gen_model_name)
-        if tok.pad_token is None and tok.eos_token is not None:
-            tok.pad_token = tok.eos_token
-        gen_model = AutoModelForSeq2SeqLM.from_pretrained(self.gen_model_name).to(DEVICE)
-        self._gen_tok = tok
-        self._gen_pipe = pipeline(
-            "text2text-generation", model=gen_model, tokenizer=tok, device=0 if DEVICE == "cuda" else -1
-        )
-
-    # -------------------- retrieval / context building ------------------
+    # ------------------------- retrieval --------------------------------
 
     def _hybrid_candidates(self, question: str) -> List[Any]:
-        # lexical
-        lex_ids = self._bm25.get_top_n(question.lower().split(), list(range(len(self._docs))), n=self.initial_k)
-        lex_docs = [self._docs[i] for i in lex_ids]
-
-        # vector
+        # BM25 lexical candidates
+        ids = self._bm25_all.get_top_n(question.lower().split(), list(range(len(self._docs))), n=self.initial_k)
+        lex_docs = [self._docs[i] for i in ids]
+        # FAISS vector candidates
         vec_docs = self.retriever.invoke(question)
-
-        # merge & dedupe by (source,page,head hash)
+        # merge + dedupe
         merged: Dict[str, Any] = {}
         for d in lex_docs + vec_docs:
             merged[_doc_key(d)] = d
@@ -196,125 +161,164 @@ class RAGQuery:
     def _retrieve_top(self, question: str) -> List[Any]:
         cands = self._hybrid_candidates(question)
         if self.use_reranker and cands:
-            ranked = self.reranker.rerank(question, cands)  # -> list[(score, doc)]
+            ranked = self.reranker.rerank(question, cands)  # [(score, doc), ...]
             return [doc for (_s, doc) in ranked[: self.final_k]]
         return cands[: self.final_k]
 
-    def _build_citations_and_context(self, docs: List[Any], max_ctx_chars: int = 8000, question: str = "") -> Tuple[List[Dict[str, Any]], str]:
+    # ---------------------- contexts / citations ------------------------
+
+    def _build_contexts(
+        self,
+        docs: List[Any],
+        question: str,
+        max_ctx_chars: int = 8000,
+    ) -> Tuple[List[Dict[str, Any]], str]:
+        """
+        Return (citations, numbered_context_string).
+        We keep a numbered context for easy citing in prompts and UI.
+        """
         parts: List[str] = []
         citations: List[Dict[str, Any]] = []
         seen = set()
 
         for i, d in enumerate(docs, start=1):
-            chunk = (d.page_content or "").strip().replace("**", "")
-            chunk = _filter_sentences_for_question(chunk, question, max_chars=1200)
+            raw = _normalize_text((d.page_content or "").strip().replace("**", ""))
+            chunk = _filter_sentences_for_question(raw, question, 1200)
             parts.append(f"Context [{i}]: {chunk}")
+
             meta = d.metadata or {}
             key = (meta.get("source"), meta.get("page"))
             if key not in seen:
                 citations.append(_fmt_citation(meta))
                 seen.add(key)
 
-        context = "\n\n".join(parts)[:max_ctx_chars]
-        return citations, context
+        ctx = "\n\n".join(parts)[:max_ctx_chars]
+        return citations, ctx
 
-    # ----------------------------- readers ------------------------------
+    # ----------------------- evidence extraction ------------------------
 
-    def _answer_extractive(self, question: str, context: str) -> Dict[str, Any]:
-        self._ensure_extractive()
-        max_input = getattr(self._qa_tok, "model_max_length", 512)
-        buffer_tokens = 32
-        q_len = _token_len(self._qa_tok, question)
-        ctx_budget = max(16, max_input - q_len - buffer_tokens)
-        context_trimmed = _trim_to_tokens(self._qa_tok, context, ctx_budget)
-        out = self._qa_pipe(question=question, context=context_trimmed)
-        return {"answer": out.get("answer"), "score": out.get("score")}
+    def _top_sentences(self, question: str, docs: List[Any], max_bullets: int = 6) -> List[Tuple[str, int]]:
+        """
+        Score individual sentences with BM25 and return up to max_bullets of
+        (sentence_text, context_id) where context_id matches [n] in numbered context.
+        """
+        sents: List[str] = []
+        ctx_ids: List[int] = []
 
-    def _answer_generative(self, question: str, numbered_context: str) -> Dict[str, Any]:
-        self._ensure_generative()
-        prompt = _build_grounded_prompt(question, numbered_context)
-        max_input = getattr(self._gen_tok, "model_max_length", 512)
-
-        if _token_len(self._gen_tok, prompt) > max_input:
-            header_only = _build_grounded_prompt(question, "")
-            header_tokens = _token_len(self._gen_tok, header_only)
-            ctx_budget = max(64, max_input - header_tokens - 16)
-            trimmed = _trim_to_tokens(self._gen_tok, numbered_context, ctx_budget)
-            prompt = _build_grounded_prompt(question, trimmed)
-
-        enc = self._gen_tok(prompt, return_tensors="pt", truncation=True, max_length=max_input)
-        enc = {k: v.to(DEVICE) for k, v in enc.items()}
-
-        model = self._gen_pipe.model
-        gen_ids = model.generate(
-            **enc,
-            max_new_tokens=160,
-            min_new_tokens=24,
-            do_sample=False,
-            no_repeat_ngram_size=3,
-            pad_token_id=self._gen_tok.pad_token_id or self._gen_tok.eos_token_id,
-        )
-        text = self._gen_tok.decode(gen_ids[0], skip_special_tokens=True).strip()
-
-        # strip leading lone citation & guard "only citations"
-        text = re.sub(r"^\s*(\[\s*\d+(?:\s*,\s*\d+)*\s*\]|\(?\s*context\s*\[\d+\]\s*\)?)\s*[:-]?\s*", "", text, flags=re.I)
-        only_cites = re.fullmatch(r"\s*(\[\s*\d+(?:\s*,\s*\d+)*\s*\]\s*)+$", text)
-        if only_cites:
-            text = f"This is defined in the cited clause {text}"
-        return {"answer": text, "score": None}
-
-    # --------------------------- strict mode ----------------------------
-
-    def _answer_strict_sentences(self, question: str, docs: List[Any], top_sentences: int = 4) -> str:
-        # collect sentences with their context id
-        sents, ctx_ids = [], []
         for idx, d in enumerate(docs, start=1):
-            for s in re.split(r"(?<=[.!?])\s+", (d.page_content or "")):
-                s2 = s.strip()
-                if s2:
+            raw = (d.page_content or "")
+            raw = _normalize_text(raw)
+            for s in re.split(r"(?<=[.!?])\s+", raw):
+                s2 = _normalize_text(s)
+                if s2 and not _is_junk_sentence(s2):
                     sents.append(s2)
                     ctx_ids.append(idx)
+
         if not sents:
-            return ""
+            return []
 
         bm = BM25Okapi([s.lower().split() for s in sents])
-        ids = bm.get_top_n(question.lower().split(), list(range(len(sents))), n=top_sentences)
-        picked = []
-        seen = set()
+        ids = bm.get_top_n(question.lower().split(), list(range(len(sents))), n=max(20, max_bullets * 3))
+
+        picked: List[Tuple[str, int]] = []
+        seen_hashes = set()
         for i in ids:
             snippet = sents[i]
-            # de-duplicate near-identical sentences
-            h = hashlib.md5(snippet[:120].encode("utf-8", errors="ignore")).hexdigest()
-            if h in seen:
+            h = hashlib.md5(snippet[:160].encode("utf-8", errors="ignore")).hexdigest()
+            if h in seen_hashes:
                 continue
-            seen.add(h)
-            picked.append(f"- {snippet} [{ctx_ids[i]}]")
-        if not picked:
-            return ""
-        return "\n".join(picked)
+            seen_hashes.add(h)
+            picked.append((snippet, ctx_ids[i]))
+            if len(picked) >= max_bullets:
+                break
+        return picked
 
-    # ------------------------------ API --------------------------------
+    # --------------------------- public API -----------------------------
 
-    def ask(self, question: str, max_ctx_chars: int = 8000) -> Dict[str, Any]:
+    def ask_evidence(self, question: str, max_bullets: int = 6) -> Dict[str, Any]:
+        """Evidence-only mode: no LLM. Returns bullets with [n] plus citations."""
         docs = self._retrieve_top(question)
-        citations, numbered_context = self._build_citations_and_context(docs, max_ctx_chars=max_ctx_chars, question=question)
+        citations, numbered_ctx = self._build_contexts(docs, question)
+        pairs = self._top_sentences(question, docs, max_bullets=max_bullets)
 
-        if self.mode == "generative":
-            ans = self._answer_generative(question, numbered_context)
-        else:
-            ans = self._answer_extractive(question, numbered_context)
+        if not pairs:
+            return {
+                "answer": "I couldn't find a matching sentence. Try rephrasing or increase final_k.",
+                "citations": citations,
+                "numbered_context": numbered_ctx,
+            }
 
-        ans["citations"] = citations
-        return ans
+        bullets = "\n".join([f"- {txt} [{cid}]" for (txt, cid) in pairs])
+        return {"answer": bullets, "citations": citations, "numbered_context": numbered_ctx}
 
-    def ask_strict(self, question: str, max_ctx_chars: int = 8000, top_sentences: int = 4) -> Dict[str, Any]:
+    # --------------------- OpenRouter summarization ---------------------
+
+    @staticmethod
+    def _openrouter_chat(api_key: str, model: str, messages: List[Dict[str, str]], max_tokens: int = 300) -> str:
         """
-        No LM generation. Return the top BM25-matched sentences with inline [n] citations.
-        Rock-solid for policy/lease Qs.
+        Minimal OpenRouter Chat Completions call. Returns the assistant text,
+        raises on non-200 or missing content.
         """
-        docs = self._retrieve_top(question)
-        citations, _ = self._build_citations_and_context(docs, max_ctx_chars=max_ctx_chars, question=question)
-        answer = self._answer_strict_sentences(question, docs, top_sentences=top_sentences)
-        if not answer:
-            answer = "I couldn't find an exact sentence. Try rephrasing or reduce final_k."
-        return {"answer": answer, "score": None, "citations": citations}
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/your-org/your-app",
+            "X-Title": "RAG Chatbot",
+        }
+        resp = requests.post(
+            url,
+            headers=headers,
+            json={"model": model, "messages": messages, "temperature": 0, "max_tokens": max_tokens},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+        if not content:
+            raise RuntimeError("OpenRouter returned empty content")
+        return content.strip()
+
+    def ask_summarized(
+        self,
+        question: str,
+        api_key: str,
+        model: str = "meta-llama/llama-3.1-70b-instruct",
+        max_bullets: int = 6,
+    ) -> Dict[str, Any]:
+        """
+        Summarize ONLY the evidence bullets using an OpenRouter LLM.
+        If api_key missing or call fails -> fall back to evidence-only.
+        """
+        base = self.ask_evidence(question, max_bullets=max_bullets)
+        bullets = base["answer"].strip()
+        citations = base["citations"]
+        numbered_ctx = base["numbered_context"]
+
+        if not api_key:
+            return {"answer": bullets, "citations": citations, "numbered_context": numbered_ctx}
+
+        system = (
+            "You are a careful assistant. You will write a concise answer using ONLY the provided evidence. "
+            "Write 2–4 sentences, paraphrased for clarity. Preserve inline numeric citations like [1], [2] "
+            "that refer to the numbered contexts. Do not invent facts or citations. If evidence is insufficient, say so."
+        )
+        user = (
+            f"Question: {question}\n\n"
+            f"Numbered Contexts:\n{numbered_ctx}\n\n"
+            f"Evidence bullets (each ends with its context number in [n]):\n{bullets}\n\n"
+            "Answer (2–4 sentences, keep [n] citations):"
+        )
+        try:
+            text = self._openrouter_chat(api_key=api_key, model=model, messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ])
+            max_ref = numbered_ctx.count("Context [")
+            text = re.sub(r"\[(\d+)\]", lambda m: f"[{m.group(1)}]" if 1 <= int(m.group(1)) <= max_ref else "", text)
+            cleaned = re.sub(r"\s+", " ", text).strip()
+            if not cleaned:
+                cleaned = bullets  # fallback
+            return {"answer": cleaned, "citations": citations, "numbered_context": numbered_ctx}
+        except Exception:
+            return {"answer": bullets, "citations": citations, "numbered_context": numbered_ctx}

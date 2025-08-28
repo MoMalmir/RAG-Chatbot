@@ -13,7 +13,6 @@ from langchain_community.vectorstores import FAISS
 
 from .utils import DEVICE, iter_input_files, stable_id
 
-
 # ---- Loader registry ---------------------------------------------------------
 def _load_with_loader(path: Path):
     ext = path.suffix.lower()

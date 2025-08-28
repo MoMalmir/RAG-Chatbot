@@ -18,3 +18,5 @@ rank-bm25>=0.2
 
 typer>=0.9
 rich>=13.7
+
+requests>=2.31

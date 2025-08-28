@@ -1,3 +1,5 @@
+import os
+import json
 import typer
 from rich import print
 from typing import List
@@ -40,36 +42,51 @@ def ingest(
 
 
 @app.command()
-def query(
+def evidence(
     question: str = typer.Argument(..., help="Your question"),
     index_dir: str = typer.Option("index"),
     embed_model: str = typer.Option("sentence-transformers/all-mpnet-base-v2"),
-    qa_model: str = typer.Option("bert-large-uncased-whole-word-masking-finetuned-squad"),
-    mode: str = typer.Option("extractive", help="extractive | generative"),
-    gen_model: str = typer.Option("google/flan-t5-base", help="Generative model name"),
     initial_k: int = typer.Option(10, "--initial-k", "--initial_k", help="Retriever candidates before rerank"),
     final_k: int = typer.Option(4, "--final-k", "--final_k", help="Contexts kept"),
-    use_reranker: bool = typer.Option(False, "--use-reranker/--no-use-reranker", help="Enable reranker"),
+    use_reranker: bool = typer.Option(True, "--use-reranker/--no-use-reranker", help="Enable reranker"),
     reranker_model: str = typer.Option("BAAI/bge-reranker-base", help="Cross-encoder model"),
+    max_bullets: int = typer.Option(6, help="Evidence sentences to return"),
 ):
     rag = RAGQuery(
         index_dir=index_dir,
         embed_model=embed_model,
-        qa_model_name=qa_model,
-        gen_model_name=gen_model,
-        mode=mode,
         initial_k=initial_k,
         final_k=final_k,
         use_reranker=use_reranker,
         reranker_model=reranker_model,
     )
-    result = rag.ask(question)
-    score = result.get("score")
-    print({
-        "answer": result["answer"],
-        "score": round(score, 4) if isinstance(score, (int, float)) else None,
-        "citations": result["citations"],
-    })
+    result = rag.ask_evidence(question, max_bullets=max_bullets)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+@app.command()
+def summarize(
+    question: str = typer.Argument(..., help="Your question"),
+    index_dir: str = typer.Option("index"),
+    embed_model: str = typer.Option("sentence-transformers/all-mpnet-base-v2"),
+    initial_k: int = typer.Option(10, "--initial-k", "--initial_k", help="Retriever candidates before rerank"),
+    final_k: int = typer.Option(4, "--final-k", "--final_k", help="Contexts kept"),
+    use_reranker: bool = typer.Option(True, "--use-reranker/--no-use-reranker", help="Enable reranker"),
+    reranker_model: str = typer.Option("BAAI/bge-reranker-base", help="Cross-encoder model"),
+    max_bullets: int = typer.Option(6, help="Evidence sentences to summarize"),
+    or_key: str = typer.Option(None, "--or-key", help="OpenRouter API key", envvar="OPENROUTER_API_KEY"),
+    or_model: str = typer.Option("meta-llama/llama-3.1-70b-instruct", "--or-model", help="OpenRouter model"),
+):
+    rag = RAGQuery(
+        index_dir=index_dir,
+        embed_model=embed_model,
+        initial_k=initial_k,
+        final_k=final_k,
+        use_reranker=use_reranker,
+        reranker_model=reranker_model,
+    )
+    result = rag.ask_summarized(question, api_key=or_key or "", model=or_model, max_bullets=max_bullets)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
