@@ -1,135 +1,146 @@
+# app.py
+import os
 import time
+import shutil
+import tempfile
 from pathlib import Path
-from typing import List
 
 import streamlit as st
 
 from ragchatbot.ingest import ingest_paths
-from ragchatbot.query import RAGSimple
+from ragchatbot.query import RAGQuery
 from ragchatbot.utils import device_info
 
-
-# --------------------------- page setup -------------------------------
-
 st.set_page_config(page_title="RAG Chatbot — Streamlit", layout="wide")
+
+# ---------- Sidebar ----------
+st.sidebar.header("Settings")
+dev, is_cuda = device_info()
+st.sidebar.info(f"**Device:** {dev} | **CUDA:** {is_cuda}")
+
+index_dir   = st.sidebar.text_input("Index directory (fallback / shared)", value="index")
+embed_model = st.sidebar.text_input("Embedding model", value="sentence-transformers/all-mpnet-base-v2")
+
+st.sidebar.subheader("Retrieval")
+initial_k    = st.sidebar.slider("initial_k (retriever fan-out)", 4, 24, 12, 1)
+final_k      = st.sidebar.slider("final_k (contexts kept)", 1, 10, 6, 1)
+use_reranker = st.sidebar.checkbox("Use cross-encoder reranker (BAAI/bge-reranker-base)", value=True)
+max_bullets  = st.sidebar.slider("Max bullets (evidence sentences)", 3, 10, 6, 1)
+
+st.sidebar.subheader("Answer mode")
+mode = st.sidebar.radio("Choose", ["Evidence (no LLM)", "Summarize with OpenRouter"], index=0)
+
+# Only show key/model when Summarize is selected
+or_key_env = os.getenv("OPENROUTER_API_KEY", "")
+or_key, or_model = "", "meta-llama/llama-3.1-70b-instruct"
+if mode == "Summarize with OpenRouter":
+    st.sidebar.subheader("LLM (OpenRouter)")
+    or_key   = st.sidebar.text_input("OpenRouter API key", value=or_key_env, type="password")
+    or_model = st.sidebar.text_input("OpenRouter model", value=or_model)
+
+# ---------- Main ----------
 st.title("RAG Chatbot — Streamlit")
+ingest_tab, ask_tab = st.tabs(["📥 Ingest Documents", "❓ Ask a Question"])
 
-tab_ingest, tab_query = st.tabs(["📥 Ingest Documents", "❓ Ask a Question"])
-
-
-# ---------------------------- side panel ------------------------------
-
-with st.sidebar:
-    dev, is_cuda = device_info()
-    st.caption(f"**Device:** {dev} | **CUDA:** {bool(is_cuda)}")
-
-    index_dir = st.text_input("Index directory", "index")
-    embed_model = st.text_input("Embedding model", "sentence-transformers/all-mpnet-base-v2")
-
-    st.markdown("---")
-    st.caption("Retrieval")
-    initial_k = st.slider("initial_k (retriever fan-out)", 4, 32, 12, step=1)
-    final_k = st.slider("final_k (contexts kept)", 1, 12, 6, step=1)
-    use_reranker = st.checkbox("Use cross-encoder reranker (BAAI/bge-reranker-base)", value=True)
-    max_bullets = st.slider("Max bullets (evidence sentences)", 2, 10, 6, step=1)
-
-    st.markdown("---")
-    st.caption("Summarization (OpenRouter)")
-    mode = st.radio("Mode", ["Evidence-only (no LLM)", "Summarize with OpenRouter"], index=0)
-    or_key = st.text_input("OpenRouter API key", type="password", placeholder="sk-or-v1-...")
-    or_model = st.text_input("OpenRouter model", value="meta-llama/llama-3.1-70b-instruct")
-
-
-# ---------------------------- ingest tab ------------------------------
-
-with tab_ingest:
-    st.subheader("Ingest Documents")
-    st.caption("Upload files/folders and build/update the FAISS index.")
-
-    inputs = st.text_area(
-        "Paths (one per line)", 
-        value="docs", 
-        help="You can list files and/or directories. Relative paths resolved from the project root."
+# ===== Ingest tab =====
+with ingest_tab:
+    st.markdown("Upload files. These will be processed **ephemerally** for your session and then deleted.")
+    uploaded = st.file_uploader(
+        "Drop files (PDF, DOCX, MD, TXT, HTML)",
+        type=["pdf", "docx", "md", "txt", "html", "htm"],
+        accept_multiple_files=True,
     )
-    recursive = st.checkbox("Recurse folders", True)
-    include = st.text_input("Include globs (comma-separated)", "*.pdf,*.docx,*.md,*.txt,*.html,*.htm")
-    exclude = st.text_input("Exclude globs (comma-separated)", "")
-    chunk_size = st.number_input("chunk_size", 200, 4000, 1000, step=50)
-    chunk_overlap = st.number_input("chunk_overlap", 0, 1000, 200, step=10)
 
-    if st.button("Build / Update Index"):
+    col_a, col_b = st.columns(2)
+    with col_a:
+        chunk_size = st.number_input("chunk_size", min_value=200, max_value=4000, step=100, value=1000)
+    with col_b:
+        chunk_overlap = st.number_input("chunk_overlap", min_value=0, max_value=1000, step=50, value=200)
+
+    if st.button("Build in-memory index for my session"):
+        if not uploaded:
+            st.warning("Please upload at least one file.")
+        else:
+            try:
+                # Write uploads to a temp folder so loaders can read paths
+                tmpdir = tempfile.mkdtemp(prefix="uploads_")
+                paths = []
+                for up in uploaded:
+                    p = Path(tmpdir) / up.name
+                    p.write_bytes(up.read())
+                    paths.append(str(p))
+
+                # Build FAISS in memory, then delete temp files right away
+                with st.spinner("Indexing…"):
+                    vs = ingest_paths(
+                        inputs=paths,
+                        index_dir=index_dir,
+                        recursive=True,
+                        include="*.pdf,*.docx,*.md,*.txt,*.html,*.htm",
+                        exclude=None,
+                        chunk_size=chunk_size,
+                        chunk_overlap=chunk_overlap,
+                        embed_model=embed_model,
+                        save_index=False,          # <— return FAISS object
+                    )
+                shutil.rmtree(tmpdir, ignore_errors=True)
+
+                # Store the vectorstore in this user's session only
+                st.session_state["vs"] = vs
+                st.success("In-memory index built for your session. (Uploads have been deleted.)")
+
+            except Exception as e:
+                st.error(f"Ingestion failed: {e}")
+
+# ===== Ask tab =====
+with ask_tab:
+    question = st.text_input("Your question", value="", placeholder="Type a question and press Enter")
+    run = st.button("Run")
+
+    if run and question.strip():
         try:
-            paths: List[str] = [p.strip() for p in inputs.splitlines() if p.strip()]
-            out = ingest_paths(
-                inputs=paths,
-                index_dir=index_dir,
-                recursive=recursive,
-                include=include or None,
-                exclude=exclude or None,
-                chunk_size=chunk_size,
-                chunk_overlap=chunk_overlap,
-                embed_model=embed_model,
-            )
-            st.success(f"Indexed to: {out}")
-        except Exception as e:
-            st.error(f"Ingestion failed: {e}")
+            # Prefer the session's in-memory vectorstore if present
+            vs = st.session_state.get("vs", None)
 
-
-# ----------------------------- qa tab ---------------------------------
-
-with tab_query:
-    st.subheader("Ask the RAG Chatbot")
-
-    with st.form("qa_form"):
-        q = st.text_input("Your question", value="What is the monthly rent?")
-        show_ctx = st.checkbox("Show retrieved contexts", value=False)
-        submitted = st.form_submit_button("Run", type="primary")
-
-    if submitted and q.strip():
-        t0 = time.time()
-        try:
-            rag = RAGSimple(
+            rag = RAGQuery(
                 index_dir=index_dir,
                 embed_model=embed_model,
                 initial_k=initial_k,
                 final_k=final_k,
                 use_reranker=use_reranker,
+                reranker_model="BAAI/bge-reranker-base",
+                vectorstore=vs,                 # <— use in-memory if available
             )
-        except Exception as e:
-            st.error(f"Failed to load index/models: {e}")
-            st.stop()
 
-        try:
-            if mode.startswith("Evidence-only"):
-                result = rag.ask_evidence(q, max_bullets=max_bullets)
-                mode_label = "evidence"
+            t0 = time.time()
+            if mode == "Evidence (no LLM)":
+                res = rag.ask_evidence(question, max_bullets=max_bullets)
             else:
-                result = rag.ask_summarized(q, api_key=or_key, model=or_model, max_bullets=max_bullets)
-                mode_label = "summarize (OpenRouter)" if or_key else "evidence (no key)"
+                api_key = or_key or or_key_env or ""
+                if not api_key:
+                    st.warning("No OpenRouter API key provided; please enter one in the sidebar or set OPENROUTER_API_KEY.")
+                res = rag.ask_summarized(question, api_key=api_key, model=or_model, max_bullets=max_bullets)
+            dt = time.time() - t0
+
+            st.markdown("## Answer")
+            st.write(res["answer"])
+            st.caption(
+                f"Latency: {dt:.2f}s | Mode: {'evidence' if mode=='Evidence (no LLM)' else 'summarize'} | "
+                f"final_k={final_k} | reranker={'True' if use_reranker else 'False'} | "
+                f"index: {'in-memory (session)' if vs is not None else 'disk (' + index_dir + ')'}"
+            )
+
+            st.markdown("## Citations")
+            for i, c in enumerate(res["citations"], start=1):
+                label = c.get("label", "unknown")
+                src = c.get("source")
+                pg  = c.get("page")
+                ft  = c.get("filetype")
+                meta = []
+                if src: meta.append(f"source: {src}")
+                if ft:  meta.append(f"filetype: {ft}")
+                if pg is not None: meta.append(f"page: {pg+1}")
+                st.markdown(f"[{i}] **{label}**  \n<sub>{' • '.join(meta)}</sub>", unsafe_allow_html=True)
+
         except Exception as e:
             st.error(f"Query failed: {e}")
-            st.stop()
-
-        dt = time.time() - t0
-
-        st.markdown("### Answer")
-        st.write(result.get("answer", "").strip())
-        st.caption(f"Latency: {dt:.2f}s | Mode: {mode_label} | final_k={final_k} | reranker={use_reranker}")
-
-        if show_ctx:
-            st.markdown("### Retrieved Contexts")
-            # Re-run retrieval just to display the docs in the same order used for citations
-            docs = rag._retrieve_top(q)
-            for i, d in enumerate(docs, start=1):
-                meta = d.metadata or {}
-                label = Path(meta.get('source','')).name if meta.get('source') else 'unknown'
-                page = meta.get('page')
-                if page is not None:
-                    label = f"{label} (p.{page+1})"
-                with st.expander(f"[{i}] {label}"):
-                    st.write((d.page_content or "").strip())
-
-        st.markdown("### Citations")
-        for i, c in enumerate(result.get("citations", []), start=1):
-            st.write(f"[{i}] **{c['label']}**")
-            st.caption(f"Source: `{c['source']}` • filetype: {c.get('filetype','n/a')}")

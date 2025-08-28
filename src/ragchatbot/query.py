@@ -100,63 +100,87 @@ def _filter_sentences_for_question(text: str, question: str, max_chars: int = 12
 # ----------------------------- core class ------------------------------
 
 class RAGQuery:
-    """
-    Retrieval + (optional) OpenRouter summarization.
-
-    Embeddings: sentence-transformers/all-mpnet-base-v2
-    Lexical:    rank-bm25
-    Vector:     FAISS
-    Reranker:   BAAI/bge-reranker-base (optional)
-    """
-
     def __init__(
         self,
         index_dir: str = "index",
         embed_model: str = "sentence-transformers/all-mpnet-base-v2",
-        initial_k: int = 10,                  # retriever fan-out
-        final_k: int = 4,                     # contexts kept
-        use_reranker: bool = True,            # cross-encoder reranker
+        qa_model_name: str = "bert-large-uncased-whole-word-masking-finetuned-squad",
+        gen_model_name: str = "google/flan-t5-base",
+        mode: str = "extractive",
+        initial_k: int = 10,
+        final_k: int = 4,
+        use_reranker: bool = True,
         reranker_model: str = "BAAI/bge-reranker-base",
+        vectorstore=None,                    
     ) -> None:
+        self.mode = mode
+        self.qa_model_name = qa_model_name
+        self.gen_model_name = gen_model_name
         self.initial_k = initial_k
         self.final_k = max(1, final_k)
-        self.use_reranker = use_reranker
 
-        # Embeddings + FAISS
+        # embeddings
         self.embeddings = HuggingFaceEmbeddings(
             model_name=embed_model,
             model_kwargs={"device": DEVICE},
             encode_kwargs={"normalize_embeddings": True},
         )
-        self.vs = FAISS.load_local(index_dir, self.embeddings, allow_dangerous_deserialization=True)
 
-        # Doc list for BM25
-        self._docs: List[Any] = list(self.vs.docstore._dict.values())
+        # vector store: prefer provided one (in-memory); otherwise load from disk
+        if vectorstore is not None:
+            self.vs = vectorstore
+        else:
+            self.vs = FAISS.load_local(index_dir, self.embeddings, allow_dangerous_deserialization=True)
+
+        # build BM25 over all chunks 
+        self._docs = list(self.vs.docstore._dict.values())
         corpus = [(d.page_content or "") for d in self._docs]
-        self._bm25_all = BM25Okapi([t.lower().split() for t in corpus])
+        self._bm25 = BM25Okapi([t.lower().split() for t in corpus])
+        self._bm25_all = self._bm25 
 
-        # FAISS retriever with MMR diversity
+        # diverse vector retriever
         self.retriever = self.vs.as_retriever(
             search_type="mmr",
-            search_kwargs={"k": initial_k, "fetch_k": max(20, initial_k * 4), "lambda_mult": 0.5},
+            search_kwargs={"k": self.initial_k, "fetch_k": max(20, self.initial_k * 4), "lambda_mult": 0.5},
         )
 
-        # Optional cross-encoder reranker
+        # reranker 
+        self.use_reranker = use_reranker
         self.reranker = Reranker(model_name=reranker_model) if use_reranker else None
+
+        # lazy models 
+        self._qa_pipe = None
+        self._qa_tok = None
+        self._gen_pipe = None
+        self._gen_tok = None
+
+        @staticmethod
+        def _doc_key(d) -> str:
+            meta = d.metadata or {}
+            src = meta.get("source", "")
+            page = str(meta.get("page", ""))
+            import hashlib
+            h = hashlib.md5((d.page_content or "")[:200].encode("utf-8", errors="ignore")).hexdigest()
+            return f"{src}::{page}::{h}"
 
     # ------------------------- retrieval --------------------------------
 
-    def _hybrid_candidates(self, question: str) -> List[Any]:
-        # BM25 lexical candidates
-        ids = self._bm25_all.get_top_n(question.lower().split(), list(range(len(self._docs))), n=self.initial_k)
-        lex_docs = [self._docs[i] for i in ids]
-        # FAISS vector candidates
+    def _hybrid_candidates(self, question: str):
+        # lexical
+        tokens = question.lower().split()
+        scores = self._bm25_all.get_scores(tokens)
+        top_idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[: self.initial_k]
+        lex_docs = [self._docs[i] for i in top_idx]
+
+        # vector (MMR)
         vec_docs = self.retriever.invoke(question)
-        # merge + dedupe
-        merged: Dict[str, Any] = {}
+
+        # merge & dedupe by (source, page, head-hash)
+        merged = {}
         for d in lex_docs + vec_docs:
-            merged[_doc_key(d)] = d
+            merged[self._doc_key(d)] = d   
         return list(merged.values())
+
 
     def _retrieve_top(self, question: str) -> List[Any]:
         cands = self._hybrid_candidates(question)
