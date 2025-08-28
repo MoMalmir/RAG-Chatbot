@@ -43,16 +43,31 @@ def ingest(
 def query(
     question: str = typer.Argument(..., help="Your question"),
     index_dir: str = typer.Option("index"),
-    k: int = typer.Option(4),
     embed_model: str = typer.Option("sentence-transformers/all-mpnet-base-v2"),
     qa_model: str = typer.Option("bert-large-uncased-whole-word-masking-finetuned-squad"),
+    mode: str = typer.Option("extractive", help="extractive | generative"),
+    gen_model: str = typer.Option("google/flan-t5-base", help="Generative model name"),
+    initial_k: int = typer.Option(10, "--initial-k", "--initial_k", help="Retriever candidates before rerank"),
+    final_k: int = typer.Option(4, "--final-k", "--final_k", help="Contexts kept"),
+    use_reranker: bool = typer.Option(False, "--use-reranker/--no-use-reranker", help="Enable reranker"),
+    reranker_model: str = typer.Option("BAAI/bge-reranker-base", help="Cross-encoder model"),
 ):
-    rag = RAGQuery(index_dir=index_dir, embed_model=embed_model, qa_model_name=qa_model, k=k)
+    rag = RAGQuery(
+        index_dir=index_dir,
+        embed_model=embed_model,
+        qa_model_name=qa_model,
+        gen_model_name=gen_model,
+        mode=mode,
+        initial_k=initial_k,
+        final_k=final_k,
+        use_reranker=use_reranker,
+        reranker_model=reranker_model,
+    )
     result = rag.ask(question)
-    # pretty light output
+    score = result.get("score")
     print({
         "answer": result["answer"],
-        "score": round(result["score"], 4) if result.get("score") is not None else None,
+        "score": round(score, 4) if isinstance(score, (int, float)) else None,
         "citations": result["citations"],
     })
 
