@@ -1,17 +1,21 @@
 # app.py
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).parent / "src"))
+
 import os
 import time
 import shutil
 import tempfile
 from pathlib import Path
-
 import streamlit as st
-
 from ragchatbot.ingest import ingest_paths
 from ragchatbot.query import RAGQuery
 from ragchatbot.utils import device_info
 
-st.set_page_config(page_title="RAG Chatbot — Streamlit", layout="wide")
+
+st.set_page_config(page_title="RAG Chatbot", layout="wide")
+
 
 # ---------- Sidebar ----------
 st.sidebar.header("Settings")
