@@ -9,10 +9,9 @@ Two-mode RAG (domain-agnostic):
    sentences, preserving [n] citations. If API key is missing or the call fails,
    we gracefully fall back to evidence-only.
 
-Keep this file compact and easy to explain in interviews.
+Compact and interview-friendly.
 """
 
-from curses import raw
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 import hashlib
@@ -40,21 +39,13 @@ def _fmt_citation(meta: Dict[str, Any]) -> Dict[str, Any]:
     return {"label": label, "source": src, "page": page, "filetype": ftype}
 
 
-def _doc_key(d) -> str:
-    """Stable doc key for deduping across BM25/FAISS results."""
-    meta = d.metadata or {}
-    src = meta.get("source", "")
-    page = str(meta.get("page", ""))
-    head = (d.page_content or "")[:200]
-    h = hashlib.md5(head.encode("utf-8", errors="ignore")).hexdigest()
-    return f"{src}::{page}::{h}"
-
 def _normalize_text(s: str) -> str:
     # join hyphenated line breaks, collapse newlines/spaces
     s = re.sub(r"-\s*\n\s*", "", s)
     s = re.sub(r"\s*\n\s*", " ", s)
     s = re.sub(r"\s+", " ", s)
     return s.strip()
+
 
 def _is_junk_sentence(s: str) -> bool:
     s_stripped = s.strip()
@@ -69,7 +60,6 @@ def _is_junk_sentence(s: str) -> bool:
         return True  # short ALL-CAPS headings like "DOCUMENTS"
     return False
 
-# ------------------------ sentence & context utils ----------------------
 
 def _filter_sentences_for_question(text: str, question: str, max_chars: int = 1200) -> str:
     """
@@ -104,14 +94,14 @@ class RAGQuery:
         self,
         index_dir: str = "index",
         embed_model: str = "sentence-transformers/all-mpnet-base-v2",
-        qa_model_name: str = "bert-large-uncased-whole-word-masking-finetuned-squad",
-        gen_model_name: str = "google/flan-t5-base",
+        qa_model_name: str = "bert-large-uncased-whole-word-masking-finetuned-squad",  # kept for parity
+        gen_model_name: str = "google/flan-t5-base",                                     # kept for parity
         mode: str = "extractive",
         initial_k: int = 10,
         final_k: int = 4,
         use_reranker: bool = True,
         reranker_model: str = "BAAI/bge-reranker-base",
-        vectorstore=None,                    
+        vectorstore=None,
     ) -> None:
         self.mode = mode
         self.qa_model_name = qa_model_name
@@ -132,11 +122,11 @@ class RAGQuery:
         else:
             self.vs = FAISS.load_local(index_dir, self.embeddings, allow_dangerous_deserialization=True)
 
-        # build BM25 over all chunks 
-        self._docs = list(self.vs.docstore._dict.values())
+        # build BM25 over all chunks
+        self._docs: List[Any] = list(self.vs.docstore._dict.values())
         corpus = [(d.page_content or "") for d in self._docs]
         self._bm25 = BM25Okapi([t.lower().split() for t in corpus])
-        self._bm25_all = self._bm25 
+        self._bm25_all = self._bm25  # alias used elsewhere
 
         # diverse vector retriever
         self.retriever = self.vs.as_retriever(
@@ -144,43 +134,36 @@ class RAGQuery:
             search_kwargs={"k": self.initial_k, "fetch_k": max(20, self.initial_k * 4), "lambda_mult": 0.5},
         )
 
-        # reranker 
+        # reranker
         self.use_reranker = use_reranker
         self.reranker = Reranker(model_name=reranker_model) if use_reranker else None
 
-        # lazy models 
-        self._qa_pipe = None
-        self._qa_tok = None
-        self._gen_pipe = None
-        self._gen_tok = None
-
-        @staticmethod
-        def _doc_key(d) -> str:
-            meta = d.metadata or {}
-            src = meta.get("source", "")
-            page = str(meta.get("page", ""))
-            import hashlib
-            h = hashlib.md5((d.page_content or "")[:200].encode("utf-8", errors="ignore")).hexdigest()
-            return f"{src}::{page}::{h}"
+    # ---- class helper (dedupe key) ----
+    @staticmethod
+    def _doc_key(d) -> str:
+        meta = d.metadata or {}
+        src = meta.get("source", "")
+        page = str(meta.get("page", ""))
+        h = hashlib.md5((d.page_content or "")[:200].encode("utf-8", errors="ignore")).hexdigest()
+        return f"{src}::{page}::{h}"
 
     # ------------------------- retrieval --------------------------------
 
-    def _hybrid_candidates(self, question: str):
-        # lexical
+    def _hybrid_candidates(self, question: str) -> List[Any]:
+        # lexical via BM25
         tokens = question.lower().split()
         scores = self._bm25_all.get_scores(tokens)
         top_idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[: self.initial_k]
         lex_docs = [self._docs[i] for i in top_idx]
 
-        # vector (MMR)
+        # vector via MMR
         vec_docs = self.retriever.invoke(question)
 
         # merge & dedupe by (source, page, head-hash)
-        merged = {}
+        merged: Dict[str, Any] = {}
         for d in lex_docs + vec_docs:
-            merged[self._doc_key(d)] = d   
+            merged[self._doc_key(d)] = d
         return list(merged.values())
-
 
     def _retrieve_top(self, question: str) -> List[Any]:
         cands = self._hybrid_candidates(question)
@@ -206,8 +189,8 @@ class RAGQuery:
         seen = set()
 
         for i, d in enumerate(docs, start=1):
-            raw = _normalize_text((d.page_content or "").strip().replace("**", ""))
-            chunk = _filter_sentences_for_question(raw, question, 1200)
+            txt = _normalize_text((d.page_content or "").strip().replace("**", ""))
+            chunk = _filter_sentences_for_question(txt, question, 1200)
             parts.append(f"Context [{i}]: {chunk}")
 
             meta = d.metadata or {}
@@ -230,8 +213,7 @@ class RAGQuery:
         ctx_ids: List[int] = []
 
         for idx, d in enumerate(docs, start=1):
-            raw = (d.page_content or "")
-            raw = _normalize_text(raw)
+            raw = _normalize_text(d.page_content or "")
             for s in re.split(r"(?<=[.!?])\s+", raw):
                 s2 = _normalize_text(s)
                 if s2 and not _is_junk_sentence(s2):

@@ -93,54 +93,67 @@ with ingest_tab:
                 st.error(f"Ingestion failed: {e}")
 
 # ===== Ask tab =====
+# ===== Ask tab =====
 with ask_tab:
     question = st.text_input("Your question", value="", placeholder="Type a question and press Enter")
-    run = st.button("Run")
+    run = st.button("Run", type="primary", disabled=st.session_state.get("busy", False))
 
     if run and question.strip():
-        try:
-            # Prefer the session's in-memory vectorstore if present
-            vs = st.session_state.get("vs", None)
+        st.session_state["busy"] = True
+        t0 = time.time()
 
-            rag = RAGQuery(
-                index_dir=index_dir,
-                embed_model=embed_model,
-                initial_k=initial_k,
-                final_k=final_k,
-                use_reranker=use_reranker,
-                reranker_model="BAAI/bge-reranker-base",
-                vectorstore=vs,                 # <— use in-memory if available
-            )
+        # Big, visible status box with spinner
+        with st.status("🔄 Working on your answer…", state="running", expanded=True) as status:
+            try:
+                status.update(label="🔎 Retrieving evidence…", state="running")
 
-            t0 = time.time()
-            if mode == "Evidence (no LLM)":
-                res = rag.ask_evidence(question, max_bullets=max_bullets)
-            else:
-                api_key = or_key or or_key_env or ""
-                if not api_key:
-                    st.warning("No OpenRouter API key provided; please enter one in the sidebar or set OPENROUTER_API_KEY.")
-                res = rag.ask_summarized(question, api_key=api_key, model=or_model, max_bullets=max_bullets)
-            dt = time.time() - t0
+                # Prefer the session's in-memory vectorstore if present
+                vs = st.session_state.get("vs", None)
+                rag = RAGQuery(
+                    index_dir=index_dir,
+                    embed_model=embed_model,
+                    initial_k=initial_k,
+                    final_k=final_k,
+                    use_reranker=use_reranker,
+                    reranker_model="BAAI/bge-reranker-base",
+                    vectorstore=vs,
+                )
 
-            st.markdown("## Answer")
-            st.write(res["answer"])
-            st.caption(
-                f"Latency: {dt:.2f}s | Mode: {'evidence' if mode=='Evidence (no LLM)' else 'summarize'} | "
-                f"final_k={final_k} | reranker={'True' if use_reranker else 'False'} | "
-                f"index: {'in-memory (session)' if vs is not None else 'disk (' + index_dir + ')'}"
-            )
+                if mode == "Evidence (no LLM)":
+                    res = rag.ask_evidence(question, max_bullets=max_bullets)
+                else:
+                    api_key = or_key or or_key_env or ""
+                    if not api_key:
+                        st.warning("No OpenRouter API key provided; please enter one in the sidebar or set OPENROUTER_API_KEY.")
+                    status.update(label="🧠 Summarizing with OpenRouter…", state="running")
+                    res = rag.ask_summarized(question, api_key=api_key, model=or_model, max_bullets=max_bullets)
 
-            st.markdown("## Citations")
-            for i, c in enumerate(res["citations"], start=1):
-                label = c.get("label", "unknown")
-                src = c.get("source")
-                pg  = c.get("page")
-                ft  = c.get("filetype")
-                meta = []
-                if src: meta.append(f"source: {src}")
-                if ft:  meta.append(f"filetype: {ft}")
-                if pg is not None: meta.append(f"page: {pg+1}")
-                st.markdown(f"[{i}] **{label}**  \n<sub>{' • '.join(meta)}</sub>", unsafe_allow_html=True)
+                dt = time.time() - t0
+                status.update(label="✅ Done", state="complete", expanded=False)
 
-        except Exception as e:
-            st.error(f"Query failed: {e}")
+                st.markdown("## Answer")
+                st.write(res["answer"])
+                st.caption(
+                    f"Latency: {dt:.2f}s | Mode: {'evidence' if mode=='Evidence (no LLM)' else 'summarize'} | "
+                    f"final_k={final_k} | reranker={'True' if use_reranker else 'False'} | "
+                    f"index: {'in-memory (session)' if vs is not None else 'disk (' + index_dir + ')'}"
+                )
+
+                st.markdown("## Citations")
+                for i, c in enumerate(res["citations"], start=1):
+                    label = c.get("label", "unknown")
+                    src = c.get("source")
+                    pg  = c.get("page")
+                    ft  = c.get("filetype")
+                    meta = []
+                    if src: meta.append(f"source: {src}")
+                    if ft:  meta.append(f"filetype: {ft}")
+                    if pg is not None: meta.append(f"page: {pg+1}")
+                    st.markdown(f"[{i}] **{label}**  \n<sub>{' • '.join(meta)}</sub>", unsafe_allow_html=True)
+
+            except Exception as e:
+                status.update(label="❌ Failed", state="error", expanded=True)
+                st.error(f"Query failed: {e}")
+
+            finally:
+                st.session_state["busy"] = False
