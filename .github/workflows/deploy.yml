@@ -11,21 +11,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1   # no need to fetch history
 
-      - name: Install Git LFS
-        run: git lfs install
-
-      - name: Push to HF Space
+      - name: Build clean deploy tree and push
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_USERNAME: ${{ vars.HF_USERNAME }}
           HF_SPACE: ${{ vars.HF_SPACE }}
         run: |
+          set -eux
+
+          # Create a clean working dir with only the files we want to publish
+          rm -rf publish
+          mkdir publish
+          rsync -a \
+            --exclude '.git' \
+            --exclude '.github' \
+            --exclude 'docs/**' \
+            --exclude 'index/**' \
+            --exclude '*.pdf' \
+            --exclude '*.faiss' \
+            --exclude '*.pkl' \
+            ./ publish/
+
+          cd publish
+          git init
           git config user.email "ms.malmir@gmail.com"
           git config user.name  "momalmir"
-          # Add or update the HF remote
-          git remote remove hf || true
+          git add .
+          git commit -m "Deploy to HF Space ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+
+          # Push this one-commit repo to the Space
           git remote add hf https://$HF_USERNAME:$HF_TOKEN@huggingface.co/spaces/$HF_USERNAME/$HF_SPACE
-          # Force-push current branch to Space main
           git push hf HEAD:main --force
