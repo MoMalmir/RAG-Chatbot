@@ -15,7 +15,12 @@ pinned: false
 
 This project is a **document‑question‑answering** app that lets users upload files, build a temporary or shared index, and **ask grounded questions**. It runs as a **Streamlit** app on **Hugging Face Spaces** and can also be used locally.
 
-[![🤗 Spaces](https://img.shields.io/badge/🤗%20Spaces-Deployed-blue)](https://huggingface.co/spaces/msmalmir/rag-chatbot-doc-qa)
+[![🤗 Spaces](https://img.shields.io/badge/🤗%20Spaces-Deployed-blue)](https://huggingface.co/spaces/momalmir/rag-chatbot-doc-qa)
+
+---
+
+![Demo](assets/demo.gif)
+
 ---
 
 ## 🧭 Two‑Mode RAG (domain‑agnostic)
