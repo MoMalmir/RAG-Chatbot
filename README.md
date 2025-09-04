@@ -8,178 +8,140 @@ app_file: app.py
 pinned: false
 ---
 
+# 🤖 RAG Chatbot — Streamlit (HF Spaces) 
 
-# 📝 Smart Resume Optimizer
+**Live demo:** https://huggingface.co/spaces/momalmir/rag-chatbot-doc-qa  
+**Stack:** Streamlit • LangChain • FAISS • sentence-transformers • BM25 • MMR • Cross‑encoder re‑ranker • OpenRouter (optional)
 
-The **Smart Resume Optimizer** is an AI-powered tool that tailors resumes to specific job descriptions.  
-It takes a user’s original resume (PDF or LaTeX), a job description, and optional prompts, then generates a **customized resume** optimized for the target role.  
-
-This project is designed for job seekers, data scientists, and ML engineers who want to stand out with targeted applications while also serving as a portfolio project showcasing **MLOps, FastAPI, Docker, CI/CD, and AI engineering**.
-
----
-
-## 🚀 Features
-
-- 📄 **Resume Uploads**  
-  - Accepts **PDF** resumes and original **LaTeX** source files.
-  - Preserves LaTeX formatting when tailoring LaTeX resumes.
-
-- 🤖 **LLM-powered Resume Optimization**  
-  - Extracts skills and experiences from the original resume.  
-  - Matches relevant content to the target job description.  
-  - Outputs an **optimized PDF resume**.
-
-- 🎯 **Customization**  
-  - Add custom prompts (e.g., “highlight leadership skills” or “emphasize bioinformatics projects”).  
-  - Condensed and ATS-friendly outputs.
-
-- 🛠️ **Tech Stack**  
-  - **Backend**: FastAPI (Python)  
-  - **Frontend**: React + TailwindCSS  
-  - **AI**: OpenAI / OpenRouter API (configurable)  
-  - **Resume Rendering**: Pandoc + LaTeX templates  
-  - **Containerization**: Docker + GitHub Codespaces  
-  - **Deployment**: Render (backend), Vercel (frontend), optional Hugging Face Spaces
+This project is a **document‑question‑answering** app that lets users upload files, build a temporary or shared index, and **ask grounded questions**. It runs as a **Streamlit** app on **Hugging Face Spaces** and can also be used locally.
 
 ---
 
-## 🏗️ Architecture
+## 🧭 Two‑Mode RAG (domain‑agnostic)
 
-```
-User → React Frontend → FastAPI Backend → LLM API → Pandoc/LaTeX → Optimized Resume (PDF)
-```
+### 1) **Evidence‑only**
+- Returns **top‑matching sentences** with inline **`[n]` citations** (no LLM).  
+- Retrieval pipeline:
+  - **BM25** (lexical) builds a corpus over all chunks and gives sparse scores.
+  - **FAISS** (vector) does semantic ANN search using Hugging Face embeddings.
+  - **MMR** (**m**aximal **m**arginal **r**elevance) on the FAISS retriever for diversity.
+  - **Optional Cross‑encoder re‑rank** (`BAAI/bge-reranker-base`) for precision at top‑k.
+- Output = **bulleted evidence list** (up to `Max bullets`) with `[n]` mapping to numbered contexts.
 
-- **Frontend (Vercel)**: Clean UI for uploading resumes, entering job descriptions, and downloading results.  
-- **Backend (Render / Docker)**: FastAPI server handles resume processing, calls LLM API, and manages LaTeX rendering.  
-- **Pandoc/LaTeX**: Ensures professional PDF formatting.  
-- **GitHub Actions CI/CD**: Automated testing, build, and deployment pipelines.  
-
----
-
-## ⚙️ Installation & Setup
-
-### 1. Clone the repo
-```bash
-git clone https://github.com/<your-username>/smart-resume-optimizer.git
-cd smart-resume-optimizer
-```
-
-### 2. Backend setup (FastAPI)
-```bash
-cd backend
-python3 -m venv .venv
-source .venv/bin/activate   # or .venv\Scripts\activate on Windows
-pip install -r requirements.txt
-```
-
-Run the server:
-```bash
-uvicorn app:app --reload --port 8000
-```
-API available at: [http://localhost:8000](http://localhost:8000)
-
-### 3. Frontend setup (React + Vite)
-```bash
-cd frontend
-npm install
-npm run dev
-```
-UI available at: [http://localhost:5173](http://localhost:5173)
-
-### 4. Environment variables
-Create `.env` in `backend/`:
-```ini
-OPENAI_API_KEY=your_api_key_here
-MODEL_NAME=gpt-4o-mini
-```
-
-### 5. Docker (optional)
-To build and run the backend with Docker:
-```bash
-docker build -t smart-resume-backend ./backend
-docker run -p 8000:8000 smart-resume-backend
-```
+### 2) **Summarize with OpenRouter**
+- Uses an LLM (via OpenRouter) to generate **2–4 sentences** that **only summarize the evidence bullets**, preserving `[n]` citations.
+- If the API key is missing or the call fails, the app cleanly **falls back** to Evidence‑only mode.
+- Great for compact, interview‑ready answers that remain **grounded** in retrieved text.
 
 ---
 
-## ⚡ Usage
+## 🔎 Hybrid Retrieval (BM25 + FAISS + MMR)
 
-1. Upload your resume (**PDF** or **LaTeX**).  
-2. Paste the **job description** or link.  
-3. (Optional) Add extra instructions.  
-4. Click **Generate Optimized Resume**.  
-5. Download the tailored PDF.  
+```
+Question → BM25 over chunks  → top lexical docs
+         → FAISS (MMR)       → top semantic docs (diverse)
+         → Merge + dedupe    → candidate set
+         → Cross‑encoder     → rerank for precision (optional)
+         → Keep top final_k  → contexts
+```
+
+- **BM25** (`rank_bm25`) excels at **exact term matching**, headers, and tabular text.
+- **FAISS** + Hugging Face embeddings excels at **semantic similarity**.
+- **MMR** (via `as_retriever(search_type="mmr")`) reduces near‑duplicates and improves coverage.
+- **Cross‑encoder** (bge‑reranker‑base) reads **(query, passage)** pairs and re‑scores them for **precision@k**.
+
+> UI knobs map to this pipeline: `initial_k` (candidate breadth), `final_k` (kept contexts), `Use cross‑encoder reranker` (on/off).
 
 ---
 
-## 🔧 Configuration
+## 🔗 Citation Mechanism: `[n]`
 
-- `config.yaml` (optional) to customize defaults:  
-  ```yaml
-  model: gpt-4o-mini
-  output_format: pdf
-  preserve_sections: true
+- We build a **numbered context block**:
   ```
-- `.env` to set API keys and deployment configs.  
-- Custom **LaTeX templates** supported via `templates/`.
+  Context [1]: ... (sentences clipped for question)
+  Context [2]: ...
+  ```
+- Evidence bullets end with `[n]` where `n` is the **context number** the sentence came from.  
+- The UI also shows a **citation panel** with entries like
+  - `filename.pdf (p.3)` or `notes.md` (page optional)
+- In **Summarize mode**, the prompt **requires the LLM to keep `[n]`** in the final text and avoid inventing citations.
+
+### Why this design?
+- `[n]` is language‑agnostic, compact, and easy to render in Streamlit.
+- It keeps the answer auditable: users can jump to **Context [n]** and verify.
 
 ---
 
-## 📦 Deployment
+## 🧱 Text & Sentence Handling
 
-### Render (Backend)
-- Push backend Docker image to **AWS ECR** or **DockerHub**.  
-- Deploy FastAPI app on **Render** (or Hugging Face Spaces).  
-
-### Vercel (Frontend)
-- Deploy frontend directly via `vercel deploy`.  
-- Set `NEXT_PUBLIC_API_URL` to backend endpoint.  
-
-### GitHub Actions (CI/CD)
-- Automated build & deploy workflow in `.github/workflows/deploy.yml`.
+- **Normalization**: join hyphenated line breaks, collapse spaces/newlines, strip Markdown artifacts (`**`), etc.
+- **Question‑aware filtering**: from each chunk we keep sentences that **share words** with the question (fallback to first sentences).
+- **Junk filter**: drop very short fragments, all‑caps headings, section labels, and symbol lines.
+- **Top‑sentences**: score individual sentences with **BM25** over sentences; keep diverse top‑N bullets (de‑dup by hash).
 
 ---
 
-## 📚 Example
+## ⚙️ Sidebar Controls (UI → Internals)
 
-Input resume (PDF):  
+| UI Control | Meaning | Internal |
+|---|---|---|
+| **Embedding model** | sentence-transformers encoder | `HuggingFaceEmbeddings(model_name=...)` |
+| **initial_k** | retriever fan‑out | FAISS `k` + BM25 top‑K for hybrid merge |
+| **final_k** | contexts kept | top `final_k` after (optional) re‑rank |
+| **Use cross‑encoder reranker** | precision boost | `BAAI/bge-reranker-base` |
+| **Max bullets** | evidence sentences | top‑N via BM25(on sentences) |
+| **chunk_size / chunk_overlap** | chunking strategy | affects recall and context integrity |
+| **Index directory** | persistence option | `index/` (shared) or in‑memory session |
+
+---
+
+## 🛠️ Local Run
+
+```bash
+git clone https://github.com/<your-username>/RAG-Chatbot.git
+cd RAG-Chatbot
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+streamlit run app.py
 ```
-Skills: Python, Machine Learning, Bioinformatics
-Projects: scRNA-seq cell typing, Resume Optimizer
-```
 
-Job description:  
+**.env (optional for summarize mode)**
+```ini
+OPENROUTER_API_KEY=your_key_here
 ```
-Looking for a Machine Learning Engineer with experience in NLP, MLOps, and FastAPI.
-```
-
-Optimized resume output:  
-- Highlights **NLP & MLOps** experience.  
-- Moves **FastAPI projects** to top of “Projects” section.  
-- Keeps LaTeX formatting intact.  
 
 ---
 
-## 🤝 Contributing
 
-Pull requests are welcome!  
-1. Fork the repo  
-2. Create a feature branch (`git checkout -b feature-name`)  
-3. Commit changes (`git commit -m 'Added X feature'`)  
-4. Push (`git push origin feature-name`)  
-5. Open a Pull Request  
+## 🧪 Usage Pattern
+
+1) **Ingest Documents**: Drop files, set `chunk_size/overlap`, build **in‑memory** index (per‑session) or persist to `/index` (shared).  
+2) **Ask a Question**: Switch tab, choose **Evidence** or **Summarize**, tune `initial_k/final_k`, toggle **re‑ranker**.  
+3) **Read result**: Bullets with `[n]` + citation panel; or a short LLM‑based summary that preserves `[n]`.
 
 ---
 
-## 📄 License
+## ❓ Troubleshooting
 
-This project is licensed under the MIT License.  
-See `LICENSE` for details.  
+- **Low recall** → increase `initial_k`, reduce `chunk_size`, enable MMR.
+- **Off‑topic bullets** → enable cross‑encoder, lower `final_k`.
+- **LLM fails** → check `OPENROUTER_API_KEY`; fallback should show evidence bullets.
+- **Scanned PDFs** → OCR not included; pre‑OCR or add an OCR step.
 
 ---
 
-## 👨‍💻 Author
+## 📜 License & Credits
 
-**Mostafa Malmir**  
-- PhD Candidate, AI/ML Engineer  
-- [GitHub](https://github.com/MoMalmir) | [LinkedIn](https://linkedin.com/in/mostafa-malmir)  
+- MIT License
+- sentence-transformers, FAISS, BAAI/bge‑reranker‑base, LangChain, Hugging Face Spaces.
+
+---
+
+## 👤 Author
+
+**Mostafa Malmir (MoMalmir)**  
+🔗 HF Space: [huggingface.co/spaces/momalmir](https://huggingface.co/spaces/momalmir)  
+🔗 GitHub: [github.com/momalmir](https://github.com/momalmir)
+🔗 LinkedIn: [linkedin.com/in/mostafa-malmir](https://linkedin.com/in/mostafa-malmir)
+
