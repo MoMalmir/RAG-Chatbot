@@ -21,7 +21,7 @@ This project is a **document‑question‑answering** app that lets users upload
 
 ![Demo](assets/demo.gif)
 
----
+
 
 ## 🧭 Two‑Mode RAG (domain‑agnostic)
 
